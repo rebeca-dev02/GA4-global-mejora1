@@ -1,0 +1,23 @@
+/*
+"""
+Description: Fails execution when the session attribution mart contains duplicate session_id rows.
+Author: Codex
+Date: 2026-02-14
+Purpose: Production
+Retention: Permanent - Guardrail to prevent join explosion regressions.
+"""
+*/
+
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.QUALITY_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "attribution", "quality"],
+  description: "Assertion ensuring one row per session_id in mart_session_attribution_enriched."
+}
+
+SELECT
+  session_id,
+  COUNT(*) AS duplicate_rows
+FROM ${ref("mart_session_attribution_enriched")}
+GROUP BY session_id
+HAVING COUNT(*) > 1

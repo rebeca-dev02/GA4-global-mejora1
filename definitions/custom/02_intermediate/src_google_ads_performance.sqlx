@@ -1,0 +1,287 @@
+// transforma el raw de Google Ads en una tabla base diaria de performance ya normalizada y enriquecida, con las
+//  conversiones clasificadas por bucket y preparada para usarse en capas intermedias y reporting.
+
+config {  //se define cómo se materializa la tabla.
+  type: "incremental",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: ["marketing", "google_ads"],
+  description: "Google Ads source-normalized daily performance at ad-level grain (campaign-level for PMax). Includes all conversion funnel stages and ad quality attributes.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["customer_id", "campaign_id"]
+  }
+}
+
+pre_operations {  //prepara el incremental antes de ejecutar el SELECT.
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      buildGoogleAdsIncrementalDateCheckpointSql(self(), googleAdsCustomerIdRaw, "customer_id", "date"),
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE date >= date_checkpoint`
+  )}
+}
+
+js {   //importa helpers JS y prepara variables reutilizables.
+  const {
+    buildGoogleAdsIncrementalDateCheckpointSql
+  } = require("includes/custom/marketing_helpers.js");
+  const {
+    buildGoogleAdsConversionBucketSql,
+    buildGoogleAdsIgnoredActionSql
+  } = require("includes/custom/marketing_helpers.js");
+  const googleAdsCustomerIdRaw = dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID || "0";
+  const adConversionBuckets = buildGoogleAdsConversionBucketSql("ac.segments_conversion_action_name");
+  const campaignConversionBuckets = buildGoogleAdsConversionBucketSql("ccs.segments_conversion_action_name");
+  const adIgnoredActionsSql = buildGoogleAdsIgnoredActionSql("ac.segments_conversion_action_name");
+  const campaignIgnoredActionsSql = buildGoogleAdsIgnoredActionSql("ccs.segments_conversion_action_name");
+}
+
+-- ============================================================================
+-- Campaign info with advertising_channel_type to detect PMax
+-- ============================================================================
+WITH campaign_info AS (
+  SELECT
+    customer_id,
+    campaign_id,
+    campaign_name,
+    campaign_advertising_channel_type
+  FROM ${ref("src_google_ads_campaign_lookup")}
+),
+
+-- ============================================================================
+-- Basic stats: Ad-level for non-PMax, AdGroup-level for PMax
+-- ============================================================================
+basic_stats AS (                                       //se construye la base de performance diaria con el grain correcto según tipo de campaña.
+  -- Non-PMax campaigns: ad-level granularity
+  SELECT
+    a.segments_date AS date,
+    a.customer_id,
+    a.campaign_id,
+    a.ad_group_id,
+    a.ad_group_ad_ad_id AS ad_id,
+    SUM(a.metrics_impressions) AS impressions,
+    SUM(a.metrics_clicks) AS clicks,
+    SUM(a.metrics_cost_micros) / 1000000 AS cost
+  FROM ${ref("ads_AdBasicStats_1534842056")} a
+  INNER JOIN campaign_info ci
+    ON a.customer_id = ci.customer_id AND a.campaign_id = ci.campaign_id
+  WHERE a.customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+    AND a.segments_date >= date_checkpoint
+    AND (ci.campaign_advertising_channel_type != 'PERFORMANCE_MAX'
+     OR ci.campaign_advertising_channel_type IS NULL)
+  GROUP BY 1, 2, 3, 4, 5
+
+  UNION ALL
+
+  -- PMax campaigns: campaign-level granularity (no ad_groups/ads in Data Transfer)
+  SELECT
+    cbs.segments_date AS date,
+    cbs.customer_id,
+    cbs.campaign_id,
+    CAST(NULL AS INT64) AS ad_group_id,
+    CAST(NULL AS INT64) AS ad_id,
+    SUM(cbs.metrics_impressions) AS impressions,
+    SUM(cbs.metrics_clicks) AS clicks,
+    SUM(cbs.metrics_cost_micros) / 1000000 AS cost
+  FROM ${ref("ads_CampaignBasicStats_1534842056")} cbs
+  INNER JOIN campaign_info ci
+    ON cbs.customer_id = ci.customer_id AND cbs.campaign_id = ci.campaign_id
+  WHERE cbs.customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+    AND cbs.segments_date >= date_checkpoint
+    AND ci.campaign_advertising_channel_type = 'PERFORMANCE_MAX'
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+-- ============================================================================
+-- Conversion stats: audited bucket mapping used by the final SELECT
+-- ============================================================================
+conversion_stats AS (                                          // Construye las conversiones bucketizadas
+  -- Non-PMax: ad-level conversions
+  SELECT
+    ac.segments_date AS date,
+    ac.customer_id,
+    ac.campaign_id,
+    ac.ad_group_id,
+    ac.ad_group_ad_ad_id AS ad_id,
+    SUM(CASE WHEN ${adConversionBuckets.crm}
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_crm,
+    SUM(CASE WHEN ${adConversionBuckets.form}
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_form,
+    SUM(CASE WHEN ${adConversionBuckets.call}
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_call,
+    SUM(CASE WHEN ${adConversionBuckets.visita}
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_visita,
+    SUM(CASE WHEN ${adConversionBuckets.noGestionado}
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_no_gestionado,
+    SUM(CASE WHEN ${adConversionBuckets.noCualificado}
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_no_cualificado,
+    SUM(CASE WHEN NOT (${adIgnoredActionsSql})
+         THEN ac.metrics_conversions ELSE 0 END) AS conversions_total,
+    SUM(CASE WHEN NOT (${adIgnoredActionsSql})
+         THEN ac.metrics_conversions_value ELSE 0 END) AS conversions_value_total
+  FROM ${ref("ads_AdConversionStats_1534842056")} ac
+  INNER JOIN campaign_info ci
+    ON ac.customer_id = ci.customer_id AND ac.campaign_id = ci.campaign_id
+  WHERE ac.customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+    AND ac.segments_date >= date_checkpoint
+    AND (ci.campaign_advertising_channel_type != 'PERFORMANCE_MAX'
+     OR ci.campaign_advertising_channel_type IS NULL)
+  GROUP BY 1, 2, 3, 4, 5
+
+  UNION ALL
+
+  -- PMax: campaign-level conversions (no ad_groups/ads in Data Transfer)
+  SELECT
+    ccs.segments_date AS date,
+    ccs.customer_id,
+    ccs.campaign_id,
+    CAST(NULL AS INT64) AS ad_group_id,
+    CAST(NULL AS INT64) AS ad_id,
+    SUM(CASE WHEN ${campaignConversionBuckets.crm}
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_crm,
+    SUM(CASE WHEN ${campaignConversionBuckets.form}
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_form,
+    SUM(CASE WHEN ${campaignConversionBuckets.call}
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_call,
+    SUM(CASE WHEN ${campaignConversionBuckets.visita}
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_visita,
+    SUM(CASE WHEN ${campaignConversionBuckets.noGestionado}
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_no_gestionado,
+    SUM(CASE WHEN ${campaignConversionBuckets.noCualificado}
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_no_cualificado,
+    SUM(CASE WHEN NOT (${campaignIgnoredActionsSql})
+         THEN ccs.metrics_conversions ELSE 0 END) AS conversions_total,
+    SUM(CASE WHEN NOT (${campaignIgnoredActionsSql})
+         THEN ccs.metrics_conversions_value ELSE 0 END) AS conversions_value_total
+  FROM ${ref("ads_CampaignConversionStats_1534842056")} ccs
+  INNER JOIN campaign_info ci
+    ON ccs.customer_id = ci.customer_id AND ccs.campaign_id = ci.campaign_id
+  WHERE ccs.customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+    AND ccs.segments_date >= date_checkpoint
+    AND ci.campaign_advertising_channel_type = 'PERFORMANCE_MAX'
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+-- ============================================================================
+-- Ad info: ad-level metadata for non-PMax campaigns
+-- ============================================================================
+ad_info AS (                                                   //trae ad_type, strength, final_urls, status
+  SELECT
+    customer_id,
+    ad_group_id,
+    ad_group_ad_ad_id AS ad_id,
+    ad_group_ad_ad_type AS ad_type,
+    ad_group_ad_ad_strength AS ad_strength,
+    ad_group_ad_ad_final_urls AS ad_final_urls,
+    ad_group_ad_status AS ad_status
+  FROM (
+    SELECT
+      customer_id,
+      ad_group_id,
+      ad_group_ad_ad_id,
+      ad_group_ad_ad_type,
+      ad_group_ad_ad_strength,
+      ad_group_ad_ad_final_urls,
+      ad_group_ad_status,
+      ROW_NUMBER() OVER (
+        PARTITION BY customer_id, ad_group_ad_ad_id
+        ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+      ) AS rn
+    FROM ${ref("ads_Ad_1534842056")}
+    WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+  )
+  WHERE rn = 1
+),
+
+-- ============================================================================
+-- Customer info with country mapping
+-- ============================================================================
+customer_info AS (   // convierte customer_id en nombre de cuenta y país.
+  SELECT
+    customer_id,
+    customer_descriptive_name,
+    country_code
+  FROM ${ref("src_google_ads_customer_lookup")}
+),
+
+ad_group_info AS (
+  SELECT
+    customer_id,
+    ad_group_id,
+    ad_group_name
+  FROM (
+    SELECT
+      customer_id,
+      ad_group_id,
+      ad_group_name,
+      _LATEST_DATE,
+      _DATA_DATE,
+      ROW_NUMBER() OVER (
+        PARTITION BY customer_id, ad_group_id
+        ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+      ) AS rn
+    FROM ${ref("ads_AdGroup_1534842056")}
+    WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+  )
+  WHERE rn = 1
+)
+
+SELECT
+  s.date,
+  cust.country_code,
+  cust.customer_descriptive_name,
+  s.customer_id,
+  s.campaign_id,
+  cmp.campaign_name,
+  s.ad_group_id,
+  ag.ad_group_name,
+  s.ad_id,
+  ai.ad_type,
+  ai.ad_strength,
+  ai.ad_final_urls,
+  ai.ad_status,
+  cmp.campaign_advertising_channel_type = 'PERFORMANCE_MAX' AS is_pmax,
+
+  s.impressions,
+  s.clicks,
+  s.cost,
+
+  COALESCE(c.conversions_form, 0) AS conversions_form,
+  COALESCE(c.conversions_call, 0) AS conversions_call,
+  COALESCE(c.conversions_crm, 0) AS conversions_crm,
+  COALESCE(c.conversions_visita, 0) AS conversions_visita,
+  COALESCE(c.conversions_no_gestionado, 0) AS conversions_no_gestionado,
+  COALESCE(c.conversions_no_cualificado, 0) AS conversions_no_cualificado,
+  COALESCE(c.conversions_total, 0) AS conversions_total,
+  COALESCE(c.conversions_value_total, 0) AS conversions_value_total
+
+FROM
+  basic_stats s
+LEFT JOIN
+  conversion_stats c
+  ON s.date = c.date
+  AND s.customer_id = c.customer_id
+  AND s.campaign_id = c.campaign_id
+  AND COALESCE(CAST(s.ad_group_id AS STRING), '__NULL__') = COALESCE(CAST(c.ad_group_id AS STRING), '__NULL__')
+  AND COALESCE(CAST(s.ad_id AS STRING), '__NULL__') = COALESCE(CAST(c.ad_id AS STRING), '__NULL__')
+LEFT JOIN
+  customer_info cust
+  ON s.customer_id = cust.customer_id
+LEFT JOIN
+  campaign_info cmp
+  ON s.customer_id = cmp.customer_id
+  AND s.campaign_id = cmp.campaign_id
+LEFT JOIN
+  ad_group_info ag
+  ON s.customer_id = ag.customer_id
+  AND s.ad_group_id = ag.ad_group_id
+LEFT JOIN
+  ad_info ai
+  ON s.customer_id = ai.customer_id
+  AND s.ad_group_id = ai.ad_group_id
+  AND s.ad_id = ai.ad_id
+

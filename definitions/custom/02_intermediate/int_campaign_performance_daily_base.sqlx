@@ -1,0 +1,309 @@
+/*
+"""
+Description: Cross-platform campaign performance staging base with normalized metrics from Google Ads, Meta Ads, and GA4.
+Author: Codex
+Date: 2026-04-21
+Purpose: Production
+Retention: Permanent - Base staging table for campaign reporting marts.
+"""
+*/
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "performance", "campaigns", "staging"],
+  description: "Campaign performance staging base with normalized dimensions, raw metrics, and derived non-ratio reporting fields.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["platform", "country_code", "campaign_id"]
+  }
+}
+
+js {
+  const { buildUnifiedCampaignMartIncrementalDateCheckpointSql } = require("includes/custom/marketing_helpers.js");
+  const googleAdsCustomerIdRaw = dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID || "0";
+  const metaAccountNamesRaw = dataform.projectConfig.vars.META_ADS_ACCOUNT_NAMES || "";
+  const dateCheckpointSql = buildUnifiedCampaignMartIncrementalDateCheckpointSql(
+    self(),
+    googleAdsCustomerIdRaw,
+    metaAccountNamesRaw
+  );
+}
+
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      dateCheckpointSql,
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE date >= date_checkpoint`
+  )}
+}
+
+WITH google_ads_raw AS (
+  SELECT
+    date,
+    'google_ads' AS platform,
+    country_code,
+    CAST(customer_id AS STRING) AS account_id,
+    customer_descriptive_name AS account_name,
+    CAST(campaign_id AS STRING) AS campaign_id,
+    campaign_name,
+    CAST(ad_group_id AS STRING) AS ad_group_or_adset_id,
+    ad_group_name AS ad_group_or_adset_name,
+    impressions,
+    clicks,
+    CAST(0 AS INT64) AS link_clicks,
+    cost AS spend,
+    conversions_form AS platform_conversions_form,
+    conversions_call AS platform_conversions_call,
+    conversions_crm AS platform_conversions_crm,
+    conversions_visita AS platform_conversions_visita,
+    conversions_no_gestionado AS platform_conversions_no_gestionado,
+    conversions_no_cualificado AS platform_conversions_no_cualificado,
+    CAST(0 AS FLOAT64) AS platform_conversions_cualificado_negativo,
+    conversions_total AS platform_conversions_total,
+    conversions_value_total AS platform_conversions_value
+  FROM ${ref("src_google_ads_performance")}
+  WHERE date >= date_checkpoint
+),
+
+google_ads AS (
+  SELECT
+    date,
+    platform,
+    country_code,
+    account_id,
+    account_name,
+    campaign_id,
+    campaign_name,
+    ad_group_or_adset_id,
+    ad_group_or_adset_name,
+    CAST(NULL AS STRING) AS ad_id,
+    CAST(NULL AS STRING) AS ad_name,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SUM(link_clicks) AS link_clicks,
+    SUM(spend) AS spend,
+    SUM(platform_conversions_form) AS platform_conversions_form,
+    SUM(platform_conversions_call) AS platform_conversions_call,
+    SUM(platform_conversions_crm) AS platform_conversions_crm,
+    SUM(platform_conversions_visita) AS platform_conversions_visita,
+    SUM(platform_conversions_no_gestionado) AS platform_conversions_no_gestionado,
+    SUM(platform_conversions_no_cualificado) AS platform_conversions_no_cualificado,
+    SUM(platform_conversions_cualificado_negativo) AS platform_conversions_cualificado_negativo,
+    SUM(platform_conversions_total) AS platform_conversions_total,
+    SUM(platform_conversions_value) AS platform_conversions_value
+  FROM google_ads_raw
+  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+),
+
+meta_ads_raw AS (
+  SELECT
+    date,
+    'meta_ads' AS platform,
+    country_code,
+    account_id,
+    account_name,
+    campaign_id,
+    campaign_name,
+    adset_id AS ad_group_or_adset_id,
+    adset_name AS ad_group_or_adset_name,
+    impressions,
+    clicks,
+    link_clicks,
+    spend,
+    conversions_form AS platform_conversions_form,
+    (conversions_cmb + conversions_contact) AS platform_conversions_call,
+    conversions_cualificado AS platform_conversions_crm,
+    conversions_visita AS platform_conversions_visita,
+    conversions_no_gestionado AS platform_conversions_no_gestionado,
+    conversions_no_cualificado AS platform_conversions_no_cualificado,
+    conversions_cualificado_negativo AS platform_conversions_cualificado_negativo,
+    conversions_total AS platform_conversions_total,
+    CAST(0 AS FLOAT64) AS platform_conversions_value
+  FROM ${ref("src_meta_ads_ad_daily")}
+  WHERE date >= date_checkpoint
+),
+
+meta_ads AS (
+  SELECT
+    date,
+    platform,
+    country_code,
+    account_id,
+    account_name,
+    campaign_id,
+    campaign_name,
+    ad_group_or_adset_id,
+    ad_group_or_adset_name,
+    CAST(NULL AS STRING) AS ad_id,
+    CAST(NULL AS STRING) AS ad_name,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SUM(link_clicks) AS link_clicks,
+    SUM(spend) AS spend,
+    SUM(platform_conversions_form) AS platform_conversions_form,
+    SUM(platform_conversions_call) AS platform_conversions_call,
+    SUM(platform_conversions_crm) AS platform_conversions_crm,
+    SUM(platform_conversions_visita) AS platform_conversions_visita,
+    SUM(platform_conversions_no_gestionado) AS platform_conversions_no_gestionado,
+    SUM(platform_conversions_no_cualificado) AS platform_conversions_no_cualificado,
+    SUM(platform_conversions_cualificado_negativo) AS platform_conversions_cualificado_negativo,
+    SUM(platform_conversions_total) AS platform_conversions_total,
+    SUM(platform_conversions_value) AS platform_conversions_value
+  FROM meta_ads_raw
+  GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
+),
+
+unified_ads AS (
+  SELECT * FROM google_ads
+  UNION ALL
+  SELECT * FROM meta_ads
+),
+
+ga4_sessions_by_campaign AS (
+  SELECT
+    s.session_date AS date,
+    s.matched_platform AS platform,
+    COALESCE(
+      CAST(s.paid_attribution.google_ads.campaign_id AS STRING),
+      CAST(s.paid_attribution.meta_ads.campaign_id AS STRING)
+    ) AS campaign_id,
+    COALESCE(
+      CAST(s.paid_attribution.google_ads.ad_group_id AS STRING),
+      CAST(s.paid_attribution.meta_ads.adset_id AS STRING)
+    ) AS ad_group_or_adset_id,
+    COUNT(DISTINCT s.session_id) AS ga4_sessions,
+    COUNT(DISTINCT s.user_pseudo_id) AS ga4_users,
+    COUNT(DISTINCT CASE WHEN sk.is_engaged_session THEN s.session_id END) AS ga4_engaged_sessions
+  FROM ${ref("int_session_paid_attribution")} s
+  LEFT JOIN ${ref("stg_ga4_session_keys")} sk
+    ON s.session_id = sk.session_id
+  WHERE s.matched_platform IN ('google_ads', 'meta_ads')
+    AND s.session_date >= date_checkpoint
+  GROUP BY 1, 2, 3, 4
+),
+
+ga4_conversions_by_campaign AS (
+  SELECT
+    m.session_date AS date,
+    m.matched_platform AS platform,
+    COALESCE(
+      CAST(m.paid_attribution.google_ads.campaign_id AS STRING),
+      CAST(m.paid_attribution.meta_ads.campaign_id AS STRING)
+    ) AS campaign_id,
+    COALESCE(
+      CAST(m.paid_attribution.google_ads.ad_group_id AS STRING),
+      CAST(m.paid_attribution.meta_ads.adset_id AS STRING)
+    ) AS ad_group_or_adset_id,
+    COUNTIF(REGEXP_CONTAINS(LOWER(e.event_name), r'cmb')) AS ga4_conversions_cmb,
+    COUNTIF(
+      REGEXP_CONTAINS(LOWER(e.event_name), r'form')
+      AND NOT REGEXP_CONTAINS(LOWER(e.event_name), r'formulario')
+    ) AS ga4_conversions_form,
+    COUNTIF(REGEXP_CONTAINS(LOWER(e.event_name), r'c2c')) AS ga4_conversions_c2c,
+    COUNTIF(e.event_name = 'generate_lead') AS ga4_conversions_generate_lead,
+    COUNTIF(e.event_name = 'page_view') AS ga4_page_views
+  FROM ${ref("int_session_paid_attribution")} m
+  INNER JOIN ${ref("ga4_events")} e
+    ON m.session_id = e.session_id
+  WHERE m.matched_platform IN ('google_ads', 'meta_ads')
+    AND m.session_date >= date_checkpoint
+    AND (
+      (
+        REGEXP_CONTAINS(LOWER(e.event_name), r'(page_view|cmb|form|c2c)')
+        AND NOT REGEXP_CONTAINS(LOWER(e.event_name), r'formulario')
+      )
+      OR e.event_name = 'generate_lead'
+    )
+  GROUP BY 1, 2, 3, 4
+),
+
+joined AS (
+  SELECT
+    COALESCE(ad.date, s.date, c.date) AS date,
+    COALESCE(ad.platform, s.platform, c.platform) AS platform,
+    COALESCE(ad.campaign_id, s.campaign_id, c.campaign_id) AS campaign_id,
+    COALESCE(ad.ad_group_or_adset_id, s.ad_group_or_adset_id, c.ad_group_or_adset_id) AS ad_group_or_adset_id,
+    ad.country_code,
+    ad.account_id,
+    ad.account_name,
+    ad.campaign_name,
+    ad.ad_group_or_adset_name,
+    ad.ad_id,
+    ad.ad_name,
+    COALESCE(ad.impressions, 0) AS impressions,
+    COALESCE(ad.clicks, 0) AS clicks,
+    COALESCE(ad.link_clicks, 0) AS link_clicks,
+    COALESCE(ad.spend, 0) AS spend,
+    COALESCE(ad.platform_conversions_form, 0) AS platform_conversions_form,
+    COALESCE(ad.platform_conversions_call, 0) AS platform_conversions_call,
+    COALESCE(ad.platform_conversions_crm, 0) AS platform_conversions_crm,
+    COALESCE(ad.platform_conversions_visita, 0) AS platform_conversions_visita,
+    COALESCE(ad.platform_conversions_no_gestionado, 0) AS platform_conversions_no_gestionado,
+    COALESCE(ad.platform_conversions_no_cualificado, 0) AS platform_conversions_no_cualificado,
+    COALESCE(ad.platform_conversions_cualificado_negativo, 0) AS platform_conversions_cualificado_negativo,
+    COALESCE(ad.platform_conversions_total, 0) AS platform_conversions_total,
+    COALESCE(ad.platform_conversions_value, 0) AS platform_conversions_value,
+    COALESCE(s.ga4_sessions, 0) AS ga4_sessions,
+    COALESCE(s.ga4_users, 0) AS ga4_users,
+    COALESCE(s.ga4_engaged_sessions, 0) AS ga4_engaged_sessions,
+    COALESCE(c.ga4_conversions_cmb, 0) AS ga4_conversions_cmb,
+    COALESCE(c.ga4_conversions_form, 0) AS ga4_conversions_form,
+    COALESCE(c.ga4_conversions_c2c, 0) AS ga4_conversions_c2c,
+    COALESCE(c.ga4_conversions_generate_lead, 0) AS ga4_conversions_generate_lead,
+    COALESCE(c.ga4_page_views, 0) AS ga4_page_views
+  FROM unified_ads ad
+  FULL OUTER JOIN ga4_sessions_by_campaign s
+    ON ad.date = s.date
+    AND ad.platform = s.platform
+    AND ad.campaign_id = s.campaign_id
+    AND ad.ad_group_or_adset_id IS NOT DISTINCT FROM s.ad_group_or_adset_id
+  FULL OUTER JOIN ga4_conversions_by_campaign c
+    ON COALESCE(ad.date, s.date) = c.date
+    AND COALESCE(ad.platform, s.platform) = c.platform
+    AND COALESCE(ad.campaign_id, s.campaign_id) = c.campaign_id
+    AND COALESCE(ad.ad_group_or_adset_id, s.ad_group_or_adset_id) IS NOT DISTINCT FROM c.ad_group_or_adset_id
+)
+
+SELECT
+  date,
+  platform,
+  country_code,
+  account_id,
+  account_name,
+  campaign_id,
+  campaign_name,
+  ad_group_or_adset_id,
+  ad_group_or_adset_name,
+  ad_id,
+  ad_name,
+  impressions,
+  clicks,
+  link_clicks,
+  spend,
+  platform_conversions_form,
+  platform_conversions_call,
+  platform_conversions_crm,
+  platform_conversions_visita,
+  platform_conversions_no_gestionado,
+  platform_conversions_no_cualificado,
+  platform_conversions_cualificado_negativo,
+  platform_conversions_total,
+  platform_conversions_value,
+  ga4_sessions,
+  ga4_users,
+  ga4_engaged_sessions,
+  ga4_conversions_cmb,
+  ga4_conversions_form,
+  ga4_conversions_c2c,
+  ga4_conversions_generate_lead,
+  ga4_page_views,
+  (ga4_conversions_cmb + ga4_conversions_form + ga4_conversions_c2c + ga4_conversions_generate_lead) AS ga4_total_leads,
+  (spend > 0 AND ga4_sessions = 0) AS is_spend_without_sessions,
+  (ga4_sessions > 0 AND spend = 0) AS is_sessions_without_spend
+FROM joined

@@ -1,0 +1,23 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: ["marketing", "meta_ads", "lookup"],
+  description: "Meta Ads account lookup with account name and derived country code."
+}
+
+js {
+  const { buildCountryCodeFromNameSql } = require("includes/custom/marketing_helpers.js");
+}
+
+SELECT
+  account AS account_name,
+  account AS account_id,
+  ${buildCountryCodeFromNameSql("account")} AS country_code
+FROM (
+  SELECT
+    account,
+    ROW_NUMBER() OVER (PARTITION BY account ORDER BY account) AS rn
+  FROM ${ref("ad_insights")}
+  WHERE account IS NOT NULL
+)
+WHERE rn = 1

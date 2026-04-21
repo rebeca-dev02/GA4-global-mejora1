@@ -1,0 +1,62 @@
+/*
+"""
+Description: Reporting mart for unified cross-platform campaign performance.
+Author: Codex
+Date: 2026-04-21
+Purpose: Production
+Retention: Permanent - Output layer for performance marketing analysis.
+"""
+*/
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.OUTPUTS_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "performance", "campaigns", "mart"],
+  description: "Thin reporting mart over the normalized campaign staging base. Keeps the key campaign-platform metrics and reporting ratios.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["platform", "country_code", "campaign_id"]
+  }
+}
+
+js {
+  const { buildUnifiedCampaignMartIncrementalDateCheckpointSql } = require("includes/custom/marketing_helpers.js");
+  const googleAdsCustomerIdRaw = dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID || "0";
+  const metaAccountNamesRaw = dataform.projectConfig.vars.META_ADS_ACCOUNT_NAMES || "";
+  const dateCheckpointSql = buildUnifiedCampaignMartIncrementalDateCheckpointSql(
+    self(),
+    googleAdsCustomerIdRaw,
+    metaAccountNamesRaw
+  );
+}
+
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      dateCheckpointSql,
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE date >= date_checkpoint`
+  )}
+}
+
+SELECT
+  CURRENT_TIMESTAMP() AS _run_timestamp,
+  b.*,
+  SAFE_DIVIDE(b.clicks, NULLIF(b.impressions, 0)) AS ctr,
+  SAFE_DIVIDE(b.spend, NULLIF(b.clicks, 0)) AS cpc,
+  SAFE_DIVIDE(b.spend * 1000, NULLIF(b.impressions, 0)) AS cpm,
+  SAFE_DIVIDE(b.spend, NULLIF(b.ga4_total_leads, 0)) AS cpl_web,
+  SAFE_DIVIDE(b.spend, NULLIF(b.platform_conversions_total, 0)) AS cpl_platform,
+  SAFE_DIVIDE(b.spend, NULLIF(b.platform_conversions_crm, 0)) AS cpql,
+  SAFE_DIVIDE(b.spend, NULLIF(b.ga4_sessions, 0)) AS cost_per_session,
+  SAFE_DIVIDE(b.ga4_sessions, NULLIF(b.spend, 0)) AS sessions_per_euro,
+  SAFE_DIVIDE(b.ga4_engaged_sessions, NULLIF(b.ga4_sessions, 0)) AS engagement_rate,
+  SAFE_DIVIDE(b.platform_conversions_total, NULLIF(b.clicks, 0)) AS conversion_rate_platform,
+  SAFE_DIVIDE(b.ga4_total_leads, NULLIF(b.ga4_sessions, 0)) AS conversion_rate_ga4,
+  SAFE_DIVIDE(b.platform_conversions_total, NULLIF(b.ga4_total_leads, 0)) AS platform_vs_ga4_ratio
+FROM ${ref("int_campaign_performance_daily_base")} b
+WHERE b.date >= date_checkpoint

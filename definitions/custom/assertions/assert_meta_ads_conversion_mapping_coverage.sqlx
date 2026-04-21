@@ -1,0 +1,60 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.QUALITY_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "meta_ads", "quality", "mapping"],
+  description: "Fails when Meta conversion names with recent volume are not covered by the current mapping, excluding explicit review cases."
+}
+
+js {
+  const {
+    buildMetaAccountFilterSql
+  } = require("includes/custom/marketing_helpers.js");
+  const {
+    buildMetaAdsConversionBucketSql,
+    buildMetaAdsExcludedFromCoverageSql
+  } = require("includes/custom/marketing_helpers.js");
+
+  const metaAccountNamesRaw = dataform.projectConfig.vars.META_ADS_ACCOUNT_NAMES || "";
+  const metaAccountFilterSql = buildMetaAccountFilterSql(metaAccountNamesRaw, "account");
+  const metaBuckets = buildMetaAdsConversionBucketSql("conversion_name");
+  const mappedConversionSql = [
+    metaBuckets.cmb,
+    metaBuckets.form,
+    metaBuckets.crm,
+    metaBuckets.contact,
+    metaBuckets.visita,
+    metaBuckets.noGestionado,
+    metaBuckets.noCualificado,
+    metaBuckets.cualificadoNegativo
+  ].join(" OR ");
+  const reviewSql = buildMetaAdsExcludedFromCoverageSql("conversion_name");
+}
+
+WITH recent_conversions AS (
+  SELECT
+    c.name AS conversion_name,
+    SUM(c.count) AS conversions
+  FROM ${ref("ad_insights")},
+    UNNEST(conversions) c
+  WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY)
+    ${metaAccountFilterSql}
+  GROUP BY 1
+),
+
+recent_totals AS (
+  SELECT
+    SUM(conversions) AS total_conversions
+  FROM recent_conversions
+)
+
+SELECT
+  c.conversion_name,
+  c.conversions,
+  ROUND(SAFE_MULTIPLY(SAFE_DIVIDE(c.conversions, t.total_conversions), 100), 4) AS pct_of_source_conversions
+FROM recent_conversions c
+CROSS JOIN recent_totals t
+WHERE c.conversion_name IS NOT NULL
+  AND c.conversions > 0
+  AND NOT (${mappedConversionSql})
+  AND NOT (${reviewSql})
+ORDER BY c.conversions DESC

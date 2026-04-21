@@ -1,0 +1,99 @@
+/*
+"""
+Description: Meta Ads ad-level daily performance. One row per (date, account, campaign, adset, ad).
+             Normalizes the raw Meta export into the canonical staging grain used by attribution and reporting.
+             AdAccounts joined for real numeric account_id (AccountId) and business name.
+Author: Codex
+Date: 2026-02-18
+Purpose: Production
+Retention: Permanent - Required staging layer for ad-level paid attribution enrichment.
+"""
+*/
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "attribution", "meta_ads"],
+  description: "Meta Ads ad-level daily data. Grain: date+campaign_id+adset_id+ad_id. Includes conversions and proper account_id from AdAccounts table.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["campaign_id", "adset_id", "ad_id"]
+  }
+}
+
+js {
+  const {
+    buildMetaAccountFilterSql,
+    buildMetaIncrementalDateCheckpointSql
+  } = require("includes/custom/marketing_helpers.js");
+  const { buildMetaAdsConversionBucketSql } = require("includes/custom/marketing_helpers.js");
+  const metaAccountNamesRaw = dataform.projectConfig.vars.META_ADS_ACCOUNT_NAMES || "";
+  const metaAccountFilterSql = buildMetaAccountFilterSql(metaAccountNamesRaw, "account");
+  const metaConversionBuckets = buildMetaAdsConversionBucketSql("c.name");
+}
+
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      buildMetaIncrementalDateCheckpointSql(self(), metaAccountNamesRaw, "ad_account_name", "date"),
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE date >= date_checkpoint`
+  )}
+}
+
+-- NOTE: AdAccounts (meta_ads_mcc_platform.AdAccounts) only contains MCC-level business account IDs,
+-- not individual ad account IDs. The account field in ad_insights is the ad account name (no numeric ID
+-- available in the raw data). account_id is set equal to account_name as a consequence.
+
+WITH account_lookup AS (
+  SELECT
+    account_name,
+    account_id,
+    country_code
+  FROM ${ref("src_meta_ads_account_lookup")}
+)
+
+SELECT
+  ai.date,
+  ai.account AS ad_account_name,
+  COALESCE(al.account_id, ai.account) AS account_id,    -- no numeric account_id available in ad_insights source
+  ai.account AS account_name,
+  COALESCE(al.country_code, 'Other') AS country_code,
+  CAST(ai.campaign_id AS STRING) AS campaign_id,
+  ai.campaign_name,
+  CAST(ai.adset_id AS STRING) AS adset_id,
+  ai.adset_name,
+  CAST(ai.ad_id AS STRING) AS ad_id,
+  ai.ad_name,
+  COALESCE(ai.impressions, 0) AS impressions,
+  COALESCE(ai.clicks, 0) AS clicks,
+  COALESCE(ai.spend, 0) AS spend,
+  COALESCE((SELECT a.count FROM UNNEST(ai.actions) a WHERE a.name = 'link_click' LIMIT 1), 0) AS link_clicks,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c WHERE ${metaConversionBuckets.cmb}), 0) AS conversions_cmb,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.form}), 0) AS conversions_form,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.crm}), 0) AS conversions_cualificado,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.contact}), 0) AS conversions_contact,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.visita}), 0) AS conversions_visita,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.noGestionado}), 0) AS conversions_no_gestionado,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.noCualificado}), 0) AS conversions_no_cualificado,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c
+            WHERE ${metaConversionBuckets.cualificadoNegativo}), 0) AS conversions_cualificado_negativo,
+  COALESCE((SELECT SUM(c.count) FROM UNNEST(ai.conversions) c), 0) AS conversions_total
+FROM ${ref("ad_insights")} ai
+LEFT JOIN account_lookup al
+  ON ai.account = al.account_name
+WHERE ai.campaign_id IS NOT NULL
+  AND ai.date IS NOT NULL
+  AND ai.ad_id IS NOT NULL
+  AND ai.date >= date_checkpoint
+  ${metaAccountFilterSql}

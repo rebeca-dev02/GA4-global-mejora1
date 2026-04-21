@@ -1,0 +1,47 @@
+/*
+"""
+Description: Reporting mart for session-grain all-channel attribution.
+Author: Codex
+Date: 2026-04-17
+Purpose: Production
+Retention: Permanent - Output layer for session attribution analysis.
+"""
+*/
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.OUTPUTS_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "attribution", "sessions", "mart"],
+  description: "Final session mart. Grain: 1 row per session_id. Includes GA4 raw attribution, GA4 last non-direct attribution, canonical channel fields (channel, matched_platform, match_method), landing page fields, and paid-media match detail. Campaign-platform metrics such as impressions, clicks, and spend live in mart_campaign_performance_daily, not here.",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_id", "source", "medium"]
+  }
+}
+
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      `SELECT COALESCE(DATE_SUB(MAX(session_date), INTERVAL 3 DAY), DATE('2020-01-01')) FROM ${self()}`,
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE session_date >= date_checkpoint`
+  )}
+}
+
+-- Contract:
+-- Grain: 1 row = 1 session_id.
+-- GA4 raw fields: source, medium, campaign, campaign_id, term, content, default_channel_grouping.
+-- GA4 last non-direct fields: lnd_source, lnd_medium, lnd_campaign, lnd_campaign_id, lnd_default_channel_grouping.
+-- Canonical analysis fields: channel, matched_platform, match_method.
+-- Paid enrichment: matched_* columns plus paid_attribution.google_ads / paid_attribution.meta_ads.
+-- Out of scope: campaign-level media metrics such as impressions, clicks, spend, CTR, CPC, CPM.
+
+SELECT
+  CURRENT_TIMESTAMP() AS _run_timestamp,
+  s.*
+FROM ${ref("int_session_paid_attribution")} s
+WHERE s.session_date >= date_checkpoint

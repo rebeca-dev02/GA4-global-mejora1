@@ -1,0 +1,158 @@
+/*
+"""
+Description: Google Ads keyword Quality Score mart. One row per keyword+date.
+             Tracks QS components alongside performance metrics.
+             sirve para analizar diariamente la calidad de las keywords de Google Ads junto con su rendimiento, para optimizar campañas de
+             search.
+Author: Codex
+Date: 2026-02-17
+Purpose: Production
+Retention: Permanent - Keyword quality analysis for search campaign optimization.
+"""
+*/
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.OUTPUTS_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "google_ads", "quality_score", "mart"],
+  description: "Google Ads keyword Quality Score mart. One row per keyword+date. Tracks QS components (ad relevance, landing page experience, expected CTR) alongside performance metrics.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["customer_id", "campaign_id"]
+  }
+}
+
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      buildGoogleAdsIncrementalDateCheckpointSql(self(), googleAdsCustomerIdRaw, "customer_id", "date"),
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE date >= date_checkpoint`
+  )}
+}
+
+js {
+  const {
+    buildGoogleAdsIncrementalDateCheckpointSql
+  } = require("includes/custom/marketing_helpers.js");
+  const googleAdsCustomerIdRaw = dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID || "0";
+}
+
+WITH keyword_info AS (
+  SELECT
+    customer_id,
+    campaign_id,
+    ad_group_id,
+    ad_group_criterion_keyword_text AS keyword_text,
+    ad_group_criterion_keyword_match_type AS match_type,
+    ad_group_criterion_quality_info_quality_score AS quality_score,
+    ad_group_criterion_quality_info_creative_quality_score AS creative_quality_score,
+    ad_group_criterion_quality_info_post_click_quality_score AS post_click_quality_score,
+    ad_group_criterion_quality_info_search_predicted_ctr AS search_predicted_ctr,
+    ad_group_criterion_criterion_id AS criterion_id,
+    ad_group_criterion_status AS keyword_status
+  FROM (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY customer_id, ad_group_criterion_criterion_id
+        ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+      ) AS rn
+    FROM ${ref("ads_Keyword_1534842056")}
+    WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+  )
+  WHERE rn = 1
+),
+
+keyword_stats AS (
+  SELECT
+    segments_date AS date,
+    customer_id,
+    campaign_id,
+    ad_group_id,
+    ad_group_criterion_criterion_id AS criterion_id,
+    SUM(metrics_impressions) AS impressions,
+    SUM(metrics_clicks) AS clicks,
+    SUM(metrics_cost_micros) / 1000000 AS cost,
+    SUM(metrics_conversions) AS conversions
+  FROM ${ref("ads_KeywordStats_1534842056")}
+  WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+    AND segments_date >= date_checkpoint
+  GROUP BY 1, 2, 3, 4, 5
+),
+
+customer_info AS (
+  SELECT
+    customer_id,
+    customer_descriptive_name,
+    country_code
+  FROM ${ref("src_google_ads_customer_lookup")}
+),
+
+campaign_info AS (
+  SELECT
+    customer_id,
+    campaign_id,
+    campaign_name
+  FROM ${ref("src_google_ads_campaign_lookup")}
+),
+
+ad_group_info AS (
+  SELECT
+    customer_id,
+    ad_group_id,
+    ad_group_name
+  FROM (
+    SELECT
+      customer_id,
+      ad_group_id,
+      ad_group_name,
+      ROW_NUMBER() OVER (
+        PARTITION BY customer_id, ad_group_id
+        ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+      ) AS rn
+    FROM ${ref("ads_AdGroup_1534842056")}
+    WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+  )
+  WHERE rn = 1
+)
+
+SELECT
+  ks.date,
+  cust.country_code,
+  cust.customer_descriptive_name AS customer_name,
+  ks.customer_id,
+  ks.campaign_id,
+  cmp.campaign_name,
+  ks.ad_group_id,
+  ag.ad_group_name,
+  ki.keyword_text,
+  ki.match_type,
+  ki.keyword_status,
+  ki.quality_score,
+  ki.creative_quality_score,
+  ki.post_click_quality_score,
+  ki.search_predicted_ctr,
+  ks.impressions,
+  ks.clicks,
+  ks.cost,
+  ks.conversions,
+  SAFE_DIVIDE(ks.clicks, NULLIF(ks.impressions, 0)) AS ctr
+FROM keyword_stats ks
+INNER JOIN keyword_info ki
+  ON ks.customer_id = ki.customer_id
+  AND ks.campaign_id = ki.campaign_id
+  AND ks.ad_group_id = ki.ad_group_id
+  AND ks.criterion_id = ki.criterion_id
+LEFT JOIN customer_info cust
+  ON ks.customer_id = cust.customer_id
+LEFT JOIN campaign_info cmp
+  ON ks.customer_id = cmp.customer_id
+  AND ks.campaign_id = cmp.campaign_id
+LEFT JOIN ad_group_info ag
+  ON ks.customer_id = ag.customer_id
+  AND ks.ad_group_id = ag.ad_group_id

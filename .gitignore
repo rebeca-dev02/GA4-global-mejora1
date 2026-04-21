@@ -1,0 +1,5 @@
+node_modules/
+.gcloud-local/
+.tmp_spain_conversion_audit.sql
+.tmp_publish_main_clean/
+.tmp_rebeca_publish/

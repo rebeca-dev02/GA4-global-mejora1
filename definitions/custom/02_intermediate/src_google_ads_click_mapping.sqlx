@@ -1,0 +1,87 @@
+// Deduplica:  sirve para traducir un gclid de Google Ads a la metadata de Ads que luego necesitas para atribución.
+// tabla puente: gclid -> metadata de click para luego unirlo con sesiones
+
+
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: ["marketing", "google_ads"],
+  description: "Google Ads source-normalized mapping table to decode GCLIDs into campaign, ad group, and account names.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["gclid"]
+  }
+}
+
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      `SELECT COALESCE(DATE_SUB(MAX(date), INTERVAL 3 DAY), DATE('2020-01-01')) FROM ${self()}`,
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE date >= date_checkpoint`
+  )}
+}
+
+WITH unique_clicks AS (
+  SELECT DISTINCT
+    click_view_gclid AS gclid,
+    campaign_id,
+    ad_group_id,
+    customer_id,
+    segments_date as date,
+    click_view_keyword AS keyword_text,
+    click_view_keyword_info_text AS keyword_match_text,
+    click_view_keyword_info_match_type AS keyword_match_type
+  FROM
+    ${ref("ads_ClickStats_1534842056")}
+  WHERE
+    click_view_gclid IS NOT NULL
+    AND customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+    AND segments_date >= date_checkpoint
+),
+
+ad_groups AS (
+  SELECT
+    customer_id,
+    ad_group_id,
+    ad_group_name
+  FROM (
+    SELECT
+      customer_id,
+      ad_group_id,
+      ad_group_name,
+      ROW_NUMBER() OVER (
+        PARTITION BY customer_id, ad_group_id
+        ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+      ) AS rn
+    FROM ${ref("ads_AdGroup_1534842056")}
+    WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+  )
+  WHERE rn = 1
+)
+
+SELECT
+  c.gclid,
+  c.date,
+  c.campaign_id,
+  cmp.campaign_name,
+  c.ad_group_id,
+  ag.ad_group_name,
+  c.customer_id,
+  acc.account_name,
+  c.keyword_text,
+  c.keyword_match_text,
+  c.keyword_match_type
+FROM
+  unique_clicks c
+LEFT JOIN
+  ${ref("src_google_ads_campaign_lookup")} cmp ON c.customer_id = cmp.customer_id AND c.campaign_id = cmp.campaign_id
+LEFT JOIN
+  ad_groups ag ON c.customer_id = ag.customer_id AND c.ad_group_id = ag.ad_group_id
+LEFT JOIN
+  ${ref("src_google_ads_customer_lookup")} acc ON c.customer_id = acc.customer_id

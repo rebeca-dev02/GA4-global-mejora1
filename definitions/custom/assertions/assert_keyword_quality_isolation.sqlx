@@ -1,0 +1,14 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.QUALITY_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "google_ads", "quality", "isolation"],
+  description: "Asserts that mart_keyword_quality contains only one customer_id per country dataset. Fails if GOOGLE_ADS_CUSTOMER_ID != 0 and foreign customer_ids are found."
+}
+
+SELECT
+  customer_id,
+  COUNT(*) AS row_count
+FROM ${ref("mart_keyword_quality")}
+WHERE CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64) != 0
+GROUP BY customer_id
+HAVING customer_id != CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)

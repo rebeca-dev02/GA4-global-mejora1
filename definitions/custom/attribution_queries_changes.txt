@@ -1,0 +1,49 @@
+"""
+Description: Change log for attribution-related BigQuery queries in ga4_global Dataform repository
+Author: Codex
+Date: 2026-02-14
+Purpose: Maintenance
+Retention: Permanent - Historical SQL change tracking for governance and audits
+"""
+
+Version: v1
+Timestamp: 2026-02-14T08:25:00Z
+Scope:
+- Added `definitions/custom/02_intermediate/stg_ga4_session_keys.sqlx`
+  - New session-level key staging table for deterministic attribution joins.
+- Added `definitions/custom/02_intermediate/stg_google_ads_session_bridge.sqlx`
+  - New Google Ads bridge keyed by `gclid` and `date`, deduplicated to one row per key.
+- Added `definitions/custom/02_intermediate/stg_meta_ads_campaign_daily.sqlx`
+  - New Meta Ads campaign daily bridge keyed by `campaign_id` and `date`.
+- Added `definitions/custom/03_outputs/mart_session_attribution_enriched.sqlx`
+  - New output mart at session grain with paid attribution struct and source precedence.
+- Added `definitions/custom/assertions/assertions_attribution_join_quality.sqlx`
+  - New incremental quality table with daily join coverage diagnostics.
+- Added `definitions/custom/assertions/assertions_mart_session_attribution_uniqueness.sqlx`
+  - New assertion to enforce one row per `session_id` in the attribution mart.
+
+Notes:
+- First implementation scoped to Paraguay release datasets with generic logic reusable for other releases.
+- String literal syntax adjusted to BigQuery Standard SQL single-quote requirements.
+
+Version: v2
+Timestamp: 2026-02-14T12:55:43+01:00
+Scope:
+- Updated `definitions/custom/02_intermediate/src_google_ads_performance.sqlx`
+  - Fixed high-cardinality join explosion by deduplicating dimension sources to one row per business key:
+    - `ads_Customer_1534842056` dedup by `customer_id`
+    - `ads_Campaign_1534842056` dedup by `customer_id, campaign_id`
+    - `ads_AdGroup_1534842056` dedup by `customer_id, ad_group_id`
+  - Replaced dimension joins to include `customer_id`:
+    - Campaign join now uses `s.customer_id = cmp.customer_id AND s.campaign_id = cmp.campaign_id`
+    - AdGroup join now uses `s.customer_id = ag.customer_id AND s.ad_group_id = ag.ad_group_id`
+  - Objective: prevent many-to-many row multiplication and unblock long-running Dataform execution.
+
+Version: v3
+Timestamp: 2026-02-14T13:37:47+01:00
+Scope:
+- Updated `definitions/custom/02_intermediate/stg_meta_ads_campaign_daily.sqlx`
+  - Fixed project resolution fallback in JS config block:
+    - from `dataform.projectConfig.defaultProject` (undefined in current config)
+    - to `dataform.projectConfig.defaultDatabase`
+  - Root cause addressed: source table reference was compiling as `undefined.meta_global_transfer.AdInsights`, causing action failure.

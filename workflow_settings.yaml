@@ -1,0 +1,20 @@
+# Public-safe workflow template.
+# Set real values in Dataform Release Configs (codeCompilationConfig) or CI/CD.
+defaultProject: your-gcp-project-id
+defaultLocation: europe-west1
+defaultDataset: analytics_example
+defaultAssertionDataset: superform_assertions
+
+vars:
+  GA4_PROJECT: your-gcp-project-id
+  GA4_DATASET: analytics_example
+  OUTPUTS_DATASET: superform_outputs_example
+  TRANSFORMATIONS_DATASET: superform_transformations_example
+  QUALITY_DATASET: superform_quality_example
+  LOCAL_TIMEZONE: Europe/Madrid
+  LABEL_GENERIC_BRAND: your_brand
+  LABEL_EXECUTION_OPERATION: manual_workflow
+  GOOGLE_ADS_CUSTOMER_ID: "0"
+  META_ADS_PROJECT: your-gcp-project-id
+  META_ADS_SOURCE: meta_api_insights
+  META_ADS_ACCOUNT_NAMES: ""

@@ -1,0 +1,18 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.QUALITY_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "google_ads", "quality"],
+  description: "Asserts grain uniqueness in mart_keyword_quality: one row per (date, customer_id, campaign_id, ad_group_id, keyword_text, match_type)."
+}
+
+SELECT
+  date,
+  customer_id,
+  campaign_id,
+  ad_group_id,
+  keyword_text,
+  match_type,
+  COUNT(*) AS duplicate_rows
+FROM ${ref("mart_keyword_quality")} ki
+GROUP BY 1, 2, 3, 4, 5, 6
+HAVING COUNT(*) > 1

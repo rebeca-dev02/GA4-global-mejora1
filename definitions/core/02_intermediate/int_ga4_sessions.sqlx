@@ -1,0 +1,224 @@
+/*
+    This file is part of "GA4 Dataform Package".
+    Copyright (C) 2023-2025 Superform Labs <support@ga4dataform.com>
+    Artem Korneev, Jules Stuifbergen,
+    Johan van de Werken, Krisztián Korpa,
+    Simon Breton
+
+    Do not redistribute this version! The open source Community version 
+    is available at GitHub:
+    https://github.com/superformlabs/ga4dataform-community 
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. 
+   
+*/
+
+-- This file transforms raw GA4 events into one modeled row per valid session with session-level traffic-source metadata.
+config {
+  type: "incremental",
+  description: "Intermediate incremental sessions table with modeling helpers implemented. 1 row per unique session_id. Contains only valid sessions.",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags:[dataform.projectConfig.vars.GA4_DATASET,"sessions","intermediate"],
+  dependencies: ["source_categories"],
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: [ "session_id" ],
+    labels: require("includes/core/helpers.js").helpers.storageLabels()
+  },
+}
+
+-- This block imports package helpers and config values used by the GA4 session model.
+js {
+    const { helpers } = require("includes/core/helpers");
+    const config = helpers.getConfig();
+}
+
+-- This block defines the incremental refresh window and rebuilds only the session dates that can still change.
+pre_operations {
+  declare date_checkpoint DATE;
+  set @@query_label = "${helpers.executionLabels()}";
+  set date_checkpoint = (
+    ${when(incremental(),
+      `select
+        coalesce(max(session_date)+1, date('${config.GA4_START_DATE}'))
+      from ${self()}
+      where is_final = true`,
+    `select date('${config.GA4_START_DATE}')`)}   /* the default, when it's not incremental */
+  );
+    -- delete some older data, since this may be updated later by GA4
+  ${
+    when(incremental(),
+      `delete from ${self()} where session_date >= date_checkpoint`
+      )
+  }
+}
+
+-- This CTE aggregates raw GA4 events into one preliminary row per session before traffic-source modeling is added.
+
+with events as (
+  select
+    session_id,
+    stream_id,
+    user_pseudo_id,
+    property_id,
+    min(table_suffix) as table_suffix,
+    count(distinct table_suffix) > 1 as is_multiday_session,
+    max(is_final) as is_final, --return true if session started on an is_final day
+
+    -- first
+    ${helpers.generateArrayAggSQL('device')},
+    ${helpers.generateArrayAggSQL('geo')},
+    ${helpers.generateArrayAggSQL('app_info')},
+    ${helpers.generateArrayAggSQL('platform')},
+    
+    struct(
+      ${helpers.generateArrayAggSQL('page.location','landing_page_location')},
+      ${helpers.generateArrayAggSQL('page.path','landing_page_path')},
+      ${helpers.generateArrayAggSQL('page.hostname','landing_page_hostname')},
+      ${helpers.generateArrayAggSQL('page.referrer','landing_page_referrer')},
+      ${helpers.generateArrayAggSQL('event_params.content_group','landing_content_group')}
+    ) as landing_page,
+    ${helpers.generateArrayAggSQL('session_traffic_source_last_click', 'session_traffic_source_last_click')},
+    
+    -- these will be packaged to a single struct later
+    ${helpers.generateTrafficSourceSQL('fixed_traffic_source','first_traffic_source')},
+    ${helpers.generateTrafficSourceSQL('fixed_traffic_source','last_traffic_source', false)},
+    ${helpers.generateClickIdTrafficSourceSQL('click_ids',config.CLICK_IDS_ARRAY,'first_click_ids')},
+    ${helpers.generateClickIdTrafficSourceSQL('click_ids',config.CLICK_IDS_ARRAY,'last_click_ids', false)},
+    
+    -- last
+    ${helpers.generateArrayAggSQL('user_id',false, false)}, -- to account for potentially multiple
+    struct(
+      ${helpers.generateArrayAggSQL('page.location','exit_page_location', false)},
+      ${helpers.generateArrayAggSQL('page.path','exit_page_path', false)},
+      ${helpers.generateArrayAggSQL('page.hostname','exit_page_hostname', false)},
+      ${helpers.generateArrayAggSQL('event_params.content_group','exit_content_group', false)}
+    ) as exit_page,
+
+    min(event_params.ga_session_number) as ga_session_number, -- could be NULL when hit comes from MP
+    
+    min(event_date) as session_date,
+    min(time.event_timestamp_utc) as session_start_timestamp_utc,
+    max(time.event_timestamp_utc) as session_end_timestamp_utc,
+    sum(event_params.engagement_time_msec) as engagement_time_msec,
+    
+    struct(
+      logical_or(event_params.session_engaged = "1") as is_engaged_session,
+      logical_or(has_source) as is_with_source,
+      not logical_or(has_source) as is_direct_session,
+      logical_or(url_params.gtm_debug is not null) as is_debug_session,
+      logical_or(url_params._gl is not null) as is_cross_domain
+    ) as session_info
+
+  from ${ref("ga4_events")}
+  where event_date >= date_checkpoint -1 -- grab 1 extra day, to include sessions starting earlier
+
+  -- only hits with user_pseudo_id and session_id
+  and user_pseudo_id is not null
+  and session_id is not null
+  group by
+    session_id,
+    stream_id,
+    user_pseudo_id,
+    property_id
+    -- this should not lead to duplicates. If it does, we'll get rid of those in ga4_sessions anyway
+),
+
+-- This CTE provides the source-category lookup used to derive channel grouping later in the model.
+source_categories as (
+    select
+     source,
+     source_category
+    from ${ref("source_categories")}
+),
+
+-- This CTE packages time fields and builds the modeled session_source struct with first and last attribution views.
+add_meta_info as (
+  select
+    * except (
+        source,
+        source_category,
+        session_start_timestamp_utc,
+        session_end_timestamp_utc,
+        engagement_time_msec,
+        first_traffic_source,
+        last_traffic_source,
+        first_click_ids,
+        last_click_ids
+        ),
+    struct(
+      session_start_timestamp_utc,
+      session_end_timestamp_utc,
+      engagement_time_msec,
+      timestamp_diff(session_end_timestamp_utc, session_start_timestamp_utc, second) as session_duration_s
+    ) as time,
+    (
+     select as struct
+      (
+        select as struct
+        first_traffic_source.*,
+        first_click_ids.*,
+        ${helpers.getDefaultChannelGroupingSQL(config,
+                                            'first_traffic_source.source',
+                                            'first_traffic_source.medium',
+                                            'first_traffic_source.campaign',
+                                            'join_first.source_category',
+                                            'first_traffic_source.term',
+                                            'first_traffic_source.content',
+                                            'first_traffic_source.campaign_id'
+                                            )} as default_channel_grouping,
+        ) first,
+      (
+        select as struct
+        last_traffic_source.*,
+        last_click_ids.*,
+        ${helpers.getDefaultChannelGroupingSQL(config,
+                                            'last_traffic_source.source',
+                                            'last_traffic_source.medium',
+                                            'last_traffic_source.campaign',
+                                            'join_last.source_category',
+                                            'last_traffic_source.term',
+                                            'last_traffic_source.content',
+                                            'last_traffic_source.campaign_id'
+                                            )} as default_channel_grouping
+      ) last
+    ) session_source
+  from events
+  left join source_categories join_first
+    on join_first.source = events.first_traffic_source.source
+  left join source_categories join_last
+    on join_last.source = events.last_traffic_source.source
+)
+
+-- This final select keeps only the session rows that are new or still incomplete and drops helper fields not needed downstream.
+select
+  * except(is_multiday_session)
+from add_meta_info
+where (
+  session_date >= date_checkpoint -- new sessions
+  or is_multiday_session -- or older sessions from yesterday
+)
+-- could be some incremental duplicates, these will be discarded downstream
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

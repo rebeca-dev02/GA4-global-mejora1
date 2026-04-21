@@ -1,0 +1,18 @@
+config {
+  type: "assertion",
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "quality", "meta_ads"],
+  description: "Asserts that Meta staging only contains the configured Meta account names for the release config."
+}
+
+js {
+  const { buildMetaDisallowedAccountsSql } = require("includes/custom/marketing_helpers.js");
+  const metaAccountNamesRaw = dataform.projectConfig.vars.META_ADS_ACCOUNT_NAMES || "";
+  const disallowedAccountsSql = buildMetaDisallowedAccountsSql(metaAccountNamesRaw, "ad_account_name");
+}
+
+SELECT
+  ad_account_name,
+  COUNT(*) AS rows_found
+FROM ${ref("src_meta_ads_ad_daily")}
+WHERE ${disallowedAccountsSql}
+GROUP BY 1

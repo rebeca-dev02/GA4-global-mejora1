@@ -1,0 +1,80 @@
+/*
+"""
+Description: Logs daily attribution join coverage and duplicate diagnostics for the session attribution mart.
+Author: Codex
+Date: 2026-02-14
+Purpose: Production
+Retention: Permanent - Quality monitoring for attribution enrichment.
+"""
+*/
+
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.QUALITY_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "attribution", "quality"],
+  description: "Daily coverage and duplicate diagnostics for session attribution enrichment.",
+  bigquery: {
+    partitionBy: "run_date",
+    clusterBy: ["session_date"]
+  }
+}
+
+pre_operations {
+  declare run_date_checkpoint DATE;
+  set run_date_checkpoint = current_date();
+  ${
+    when(
+      incremental(),
+      `delete from ${self()} where run_date = run_date_checkpoint`
+    )
+  }
+}
+
+WITH mart AS (
+  SELECT
+    session_id,
+    session_date,
+    session_gclid,
+    matched_platform
+  FROM ${ref("mart_session_attribution_enriched")}
+  WHERE session_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY)
+),
+
+daily AS (
+  SELECT
+    session_date,
+    COUNT(DISTINCT session_id) AS sessions_total,
+    COUNTIF(session_gclid IS NOT NULL) AS sessions_with_gclid,
+    COUNTIF(matched_platform = 'google_ads') AS sessions_google_matched,
+    COUNTIF(matched_platform = 'meta_ads') AS sessions_meta_matched,
+    COUNTIF(matched_platform IS NULL) AS sessions_unmatched
+  FROM mart
+  GROUP BY 1
+),
+
+dup AS (
+  SELECT
+    session_date,
+    COUNT(*) AS rows_in_mart,
+    COUNT(DISTINCT session_id) AS distinct_sessions,
+    COUNT(*) - COUNT(DISTINCT session_id) AS duplicate_rows
+  FROM mart
+  GROUP BY 1
+)
+
+SELECT
+  CURRENT_DATE() AS run_date,
+  d.session_date,
+  d.sessions_total,
+  d.sessions_with_gclid,
+  d.sessions_google_matched,
+  d.sessions_meta_matched,
+  d.sessions_unmatched,
+  SAFE_MULTIPLY(SAFE_DIVIDE(d.sessions_google_matched, d.sessions_total), 100) AS pct_google_matched,
+  SAFE_MULTIPLY(SAFE_DIVIDE(d.sessions_meta_matched, d.sessions_total), 100) AS pct_meta_matched,
+  SAFE_MULTIPLY(SAFE_DIVIDE(d.sessions_unmatched, d.sessions_total), 100) AS pct_unmatched,
+  x.rows_in_mart,
+  x.distinct_sessions,
+  x.duplicate_rows
+FROM daily d
+JOIN dup x USING (session_date)

@@ -1,0 +1,34 @@
+// Deduplica: Evita repetir en varios modelos la misma lógica de:
+//- ir a ads_Campaign_1534842056
+//- coger la última fila por campaña
+//- sacar nombre y tipo de canal
+// las tablas de entidades de Google Ads transfer funcionan como snapshots repetidos del estado de la entidad
+
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: ["marketing", "google_ads", "lookup"],
+  description: "Latest Google Ads campaign lookup with campaign name and advertising channel type."
+}
+
+SELECT
+  customer_id,
+  campaign_id,
+  campaign_name,
+  campaign_advertising_channel_type   //sirve para detectar performance_max
+FROM (
+  SELECT
+    customer_id,
+    campaign_id,
+    campaign_name,
+    campaign_advertising_channel_type,
+    _LATEST_DATE,
+    _DATA_DATE,
+    ROW_NUMBER() OVER (
+      PARTITION BY customer_id, campaign_id
+      ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+    ) AS rn
+  FROM ${ref("ads_Campaign_1534842056")}
+  WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+)
+WHERE rn = 1

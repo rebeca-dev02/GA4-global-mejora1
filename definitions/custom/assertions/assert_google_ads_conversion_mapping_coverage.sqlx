@@ -1,0 +1,75 @@
+config {
+  type: "assertion",
+  schema: dataform.projectConfig.vars.QUALITY_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "google_ads", "quality", "mapping"],
+  description: "Fails when Google Ads conversion action names with recent volume are not covered by the current mapping, excluding explicit review/out_of_scope cases."
+}
+
+js {
+  const {
+    parseGoogleAdsCustomerId
+  } = require("includes/custom/marketing_helpers.js");
+  const {
+    buildGoogleAdsConversionBucketSql,
+    buildGoogleAdsExcludedFromCoverageSql
+  } = require("includes/custom/marketing_helpers.js");
+
+  const googleAdsCustomerId = parseGoogleAdsCustomerId(dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID || "0");
+  const adBuckets = buildGoogleAdsConversionBucketSql("action_name");
+  const mappedActionSql = [
+    adBuckets.crm,
+    adBuckets.form,
+    adBuckets.call,
+    adBuckets.visita,
+    adBuckets.noGestionado,
+    adBuckets.noCualificado
+  ].join(" OR ");
+  const customerFilterSql = googleAdsCustomerId !== 0
+    ? `customer_id = CAST(${googleAdsCustomerId} AS INT64)`
+    : "FALSE";
+  const exclusionsSql = buildGoogleAdsExcludedFromCoverageSql("action_name");
+}
+
+WITH recent_actions AS (
+  SELECT
+    "ad_conversion_stats" AS source_name,
+    ac.segments_conversion_action_name AS action_name,
+    SUM(ac.metrics_conversions) AS conversions
+  FROM ${ref("ads_AdConversionStats_1534842056")} ac
+  WHERE ${customerFilterSql}
+    AND ac.segments_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY)
+  GROUP BY 1, 2
+
+  UNION ALL
+
+  SELECT
+    "campaign_conversion_stats" AS source_name,
+    ccs.segments_conversion_action_name AS action_name,
+    SUM(ccs.metrics_conversions) AS conversions
+  FROM ${ref("ads_CampaignConversionStats_1534842056")} ccs
+  WHERE ${customerFilterSql}
+    AND ccs.segments_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY)
+  GROUP BY 1, 2
+),
+
+recent_totals AS (
+  SELECT
+    source_name,
+    SUM(conversions) AS total_conversions
+  FROM recent_actions
+  GROUP BY 1
+)
+
+SELECT
+  a.source_name,
+  a.action_name,
+  a.conversions,
+  ROUND(SAFE_MULTIPLY(SAFE_DIVIDE(a.conversions, t.total_conversions), 100), 4) AS pct_of_source_conversions
+FROM recent_actions a
+JOIN recent_totals t
+  USING (source_name)
+WHERE a.action_name IS NOT NULL
+  AND a.conversions > 0
+  AND NOT (${mappedActionSql})
+  AND NOT (${exclusionsSql})
+ORDER BY a.source_name, a.conversions DESC

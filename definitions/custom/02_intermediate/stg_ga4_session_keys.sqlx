@@ -1,0 +1,67 @@
+/*
+"""
+Description: Extracts session-level attribution keys from ga4_sessions for deterministic paid-media joins.
+Author: Codex
+Date: 2026-02-14
+Purpose: Production
+Retention: Permanent - Core staging layer for session attribution enrichment.
+"""
+*/
+
+-- This file extracts the session fields that are later used to match GA4 sessions with paid-media data.
+config {
+  type: "incremental",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "attribution", "sessions"],
+  description: "Session-level key table used for deterministic attribution joins.",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_id", "session_gclid"]
+  }
+}
+
+-- This block defines the incremental refresh window so only recent session keys are rebuilt each run.
+pre_operations {
+  declare date_checkpoint DATE;
+  set date_checkpoint = (
+    ${when(incremental(),
+      `SELECT COALESCE(DATE_SUB(MAX(session_date), INTERVAL 3 DAY), DATE('2020-01-01')) FROM ${self()}`,
+      `SELECT DATE('2020-01-01')`
+    )}
+  );
+  ${when(incremental(),
+    `DELETE FROM ${self()} WHERE session_date >= date_checkpoint`
+  )}
+}
+
+-- This final select keeps one row per session with the attribution keys needed by the paid-media intermediate models.
+SELECT
+  s.session_id,
+  s.session_date,
+  s.user_pseudo_id,
+  s.property_id,
+  s.landing_page.landing_page_path AS landing_page_path,
+  s.landing_page.landing_content_group AS landing_content_group,
+  s.session_source.source AS source,
+  s.session_source.medium AS medium,
+  s.session_source.campaign AS campaign,
+  s.session_source.campaign_id AS campaign_id,
+  s.session_source.term AS term,
+  s.session_source.content AS content,
+  s.session_source.default_channel_grouping AS default_channel_grouping,
+  COALESCE(s.session_source.gclid, s.last_non_direct_traffic_source.gclid) AS session_gclid,
+  s.session_source.dclid AS session_dclid,
+  s.session_source.srsltid AS session_srsltid,
+  s.session_source.gbraid AS session_gbraid,
+  s.session_source.wbraid AS session_wbraid,
+  s.session_source.msclkid AS session_msclkid,
+  s.session_info.is_engaged_session,
+  s.ga_session_number,
+  s.last_non_direct_traffic_source.source AS lnd_source,
+  s.last_non_direct_traffic_source.medium AS lnd_medium,
+  s.last_non_direct_traffic_source.campaign AS lnd_campaign,
+  s.last_non_direct_traffic_source.campaign_id AS lnd_campaign_id,
+  s.last_non_direct_traffic_source.default_channel_grouping AS lnd_default_channel_grouping
+FROM ${ref("ga4_sessions")} s
+WHERE s.session_date >= date_checkpoint
+QUALIFY ROW_NUMBER() OVER (PARTITION BY s.session_id ORDER BY s.session_date DESC) = 1

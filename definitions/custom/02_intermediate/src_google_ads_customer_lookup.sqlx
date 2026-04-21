@@ -1,0 +1,29 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.TRANSFORMATIONS_DATASET,
+  tags: ["marketing", "google_ads", "lookup"],
+  description: "Latest Google Ads customer lookup with account name and derived country code."
+}
+
+js {
+  const { buildCountryCodeFromNameSql } = require("includes/custom/marketing_helpers.js");
+}
+
+SELECT
+  customer_id,
+  customer_descriptive_name,
+  ${buildCountryCodeFromNameSql("customer_descriptive_name")} AS country_code
+FROM (
+  SELECT
+    customer_id,
+    customer_descriptive_name,
+    _LATEST_DATE,
+    _DATA_DATE,
+    ROW_NUMBER() OVER (
+      PARTITION BY customer_id
+      ORDER BY _LATEST_DATE DESC, _DATA_DATE DESC
+    ) AS rn
+  FROM ${ref("ads_Customer_1534842056")}
+  WHERE customer_id = CAST(${dataform.projectConfig.vars.GOOGLE_ADS_CUSTOMER_ID} AS INT64)
+)
+WHERE rn = 1

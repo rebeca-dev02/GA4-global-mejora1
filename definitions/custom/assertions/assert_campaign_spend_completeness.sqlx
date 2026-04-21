@@ -1,0 +1,62 @@
+/*
+"""
+Description: Verifies that total spend in mart_campaign_performance_daily matches source tables.
+Author: Codex
+Date: 2026-04-21
+Purpose: Production
+Retention: Permanent - Quality gate for spend data completeness.
+"""
+*/
+
+config {
+  type: "assertion",
+  tags: [dataform.projectConfig.vars.LABEL_EXECUTION_OPERATION, "quality", "spend"],
+  description: "Asserts that total spend in the campaign performance mart matches the sum of spend in src_google_ads_performance (Google) and src_meta_ads_ad_daily (Meta) within a 1% tolerance."
+}
+
+WITH mart_spend AS (
+  SELECT
+    platform,
+    SUM(spend) AS total_spend
+  FROM ${ref("mart_campaign_performance_daily")}
+  GROUP BY 1
+),
+
+source_google AS (
+  SELECT
+    'google_ads' AS platform,
+    SUM(cost) AS total_spend
+  FROM ${ref("src_google_ads_performance")}
+),
+
+source_meta AS (
+  SELECT
+    'meta_ads' AS platform,
+    SUM(spend) AS total_spend
+  FROM ${ref("src_meta_ads_ad_daily")}
+),
+
+source_spend AS (
+  SELECT * FROM source_google
+  UNION ALL
+  SELECT * FROM source_meta
+),
+
+comparison AS (
+  SELECT
+    COALESCE(m.platform, s.platform) AS platform,
+    COALESCE(m.total_spend, 0) AS mart_spend,
+    COALESCE(s.total_spend, 0) AS source_spend,
+    ABS(COALESCE(m.total_spend, 0) - COALESCE(s.total_spend, 0)) AS spend_diff,
+    SAFE_DIVIDE(
+      ABS(COALESCE(m.total_spend, 0) - COALESCE(s.total_spend, 0)),
+      NULLIF(COALESCE(s.total_spend, 0), 0)
+    ) AS pct_diff
+  FROM mart_spend m
+  FULL OUTER JOIN source_spend s USING (platform)
+)
+
+SELECT *
+FROM comparison
+WHERE pct_diff > 0.01
+   OR (source_spend > 0 AND mart_spend = 0)
